@@ -1,0 +1,38 @@
+[package]
+name = "ppt-sync"
+version = "0.1.0"
+authors = ["MinusKelvin <mark.carlson@minuskelvin.net>"]
+edition = "2018"
+
+[dependencies]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies.tokio]
+version = "0.2.19"
+features = [
+    "rt-threaded",
+    "macros",
+    "tcp",
+    "net",
+    "sync",
+    "io-util",
+    "rt-util",
+    "time",
+    "blocking"
+]
+
+[dependencies.winapi]
+version = "0.3.8"
+features = [
+    "impl-default",
+    "psapi",
+    "processthreadsapi",
+    "winnt",
+    "handleapi",
+    "memoryapi",
+    "debugapi",
+    "winbase",
+    "minwinbase",
+    "errhandlingapi"
+]
