@@ -1,7 +1,6 @@
-use std::sync::Arc;
-use tokio::prelude::*;
-use tokio::net::TcpListener;
-use tokio::sync::{ Barrier, Notify };
+use std::sync::mpsc::{ Sender, Receiver, channel };
+use std::net::TcpListener;
+use std::io::prelude::*;
 use winapi::um::psapi::{ EnumProcesses, EnumProcessModules, GetModuleBaseNameW };
 use winapi::um::processthreadsapi::{ OpenProcess, OpenThread, GetThreadContext, SetThreadContext };
 use winapi::um::winnt::*;
@@ -15,65 +14,67 @@ use std::os::windows::ffi::OsStringExt;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let barrier = Arc::new(Barrier::new(2));
-    let notifier = Arc::new(Notify::new());
-
-    let mut listener = TcpListener::bind("127.0.0.1:57236").await?;
+fn main() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:57236")?;
     println!();
-    let mut connections = vec![];
-    connections.push((listener.accept().await?.0, true));
 
-    let b = barrier.clone();
-    let n = notifier.clone();
-    let mut ppt = tokio::task::spawn_blocking(move || {
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            unsafe {
-                ppt_sync(&b, &n).await;
-            }
-        });
-    });
+    let (done, waiter) = channel();
+    let (notifs, conns) = channel();
 
-    while !connections.is_empty() {
-        tokio::select! {
-            incoming = listener.accept() => {
-                let socket = incoming?.0;
-                socket.set_nodelay(true)?;
-                connections.push((socket, true));
-            }
-            _ = barrier.wait() => {
-                for (socket, status) in &mut connections {
-                    *status = socket.write(&[0]).await.is_ok();
-                    *status = socket.flush().await.is_ok();
+    std::thread::spawn(move || { let _: Result<_> = (|| {
+        for connection in listener.incoming() {
+            let mut connection = connection?;
+            let (notifier, wait) = channel();
+            notifs.send(notifier)?;
+            let done = done.clone();
+            connection.set_nodelay(true)?;
+            std::thread::spawn(move || { let _: Result<_> = (|| loop {
+                wait.recv()?;
+                let good = (|| {
+                    connection.write(&[0])?;
+                    connection.flush()?;
+                    connection.read_exact(&mut [0])
+                })().is_ok();
+                if !good {
+                    drop(wait);
+                    done.send(())?;
+                    return Ok(())
                 }
-                for (socket, status) in &mut connections {
-                    *status = socket.read_exact(&mut [0]).await.is_ok();
-                }
-                connections.retain(|&(_, status)| status);
-
-                barrier.wait().await;
-            }
-            _ = &mut ppt => break
+                done.send(())?;
+            })();});
         }
-    }
+        Ok(())
+    })();});
 
-    notifier.notify();
-    let _ = ppt.await;
+    unsafe {
+        ppt_sync(waiter, conns);
+    }
 
     Ok(())
 }
 
-fn find_ppt_process() -> Result<Option<u32>> {
+macro_rules! w {
+    ($f:ident($($content:tt)*)) => {
+        match $f($($content)*) {
+            0 => {
+                eprintln!(
+                    "{} (line {}) failed with error code {}",
+                    stringify!(f), line!(), GetLastError()
+                );
+                None
+            }
+            v => Some(v)
+        }
+    };
+}
+
+fn find_ppt_process() -> Option<u32> {
     unsafe {
         let mut pids = [0; 4096];
         let mut used = 0;
-        if EnumProcesses(
+        w!(EnumProcesses(
             pids.as_mut_ptr(), std::mem::size_of_val(&pids) as u32, &mut used
-        ) == 0 {
-            panic!("failed to enumerate processes");
-        }
+        )).unwrap();
 
         for &process in &pids[..used as usize/std::mem::size_of::<u32>()] {
             let handle = OpenProcess(
@@ -97,7 +98,7 @@ fn find_ppt_process() -> Result<Option<u32>> {
                             if let Some(s) = s.to_str() {
                                 if s == "puyopuyotetris.exe" {
                                     CloseHandle(handle);
-                                    return Ok(Some(process))
+                                    return Some(process)
                                 }
                             }
                             break
@@ -108,36 +109,35 @@ fn find_ppt_process() -> Result<Option<u32>> {
                 CloseHandle(handle);
             }
         }
-        Ok(None)
+        None
     }
 }
 
-fn wait_for_event() -> DEBUG_EVENT {
-    tokio::task::block_in_place(|| unsafe {
-        let mut event = Default::default();
-        WaitForDebugEvent(&mut event, INFINITE);
-        event
-    })
+unsafe fn wait_for_event() -> DEBUG_EVENT {
+    let mut event = Default::default();
+    WaitForDebugEvent(&mut event, INFINITE);
+    event
 }
 
-async unsafe fn ppt_sync(barrier: &Barrier, notifier: &Notify) {
+unsafe fn ppt_sync(waiter: Receiver<()>, new: Receiver<Sender<()>>) {
     let pid;
     loop {
-        if let Some(p) = find_ppt_process().unwrap() {
+        if let Some(p) = find_ppt_process() {
             pid = p;
             break
         }
-        tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
-    if DebugActiveProcess(pid) == 0 {
-        eprintln!("Failed to attach to PPT as a debugger");
-        return;
+    if w!(DebugActiveProcess(pid)).is_none() {
+        return
     }
 
     let event = wait_for_event();
     if event.dwDebugEventCode != CREATE_PROCESS_DEBUG_EVENT {
-        panic!("first debug event should have been a CREATE_PROCESS_DEBUG_EVENT");
+        eprintln!("first debug event should have been a CREATE_PROCESS_DEBUG_EVENT");
+        w!(DebugActiveProcessStop(pid));
+        return;
     }
 
     let process = event.u.CreateProcessInfo().hProcess;
@@ -147,6 +147,11 @@ async unsafe fn ppt_sync(barrier: &Barrier, notifier: &Notify) {
     // this instruction is executed after the call that does window swap buffers
     const INSTRUCTION_ADDRESS: u64 = 0x14025B8CC;
 
+    let mut clients = vec![];
+    if let Ok(c) = new.recv(){
+        clients.push(c);
+    }
+
     loop {
         // wait until breakpoint is hit
         if breakpoint(
@@ -155,21 +160,21 @@ async unsafe fn ppt_sync(barrier: &Barrier, notifier: &Notify) {
             break
         }
 
-        // sync with socket task so it can notify listeners
-        tokio::select! {
-            _ = barrier.wait() => {}
-            _ = notifier.notified() => {
-                if ContinueDebugEvent(pid, tid, continue_kind) == 0 { panic!(); }
-                break
-            }
+        // collect new clients
+        for c in new.try_iter() {
+            clients.push(c);
         }
-        // sync with socket task so we know the listeners have responded
-        tokio::select! {
-            _ = barrier.wait() => {}
-            _ = notifier.notified() => {
-                if ContinueDebugEvent(pid, tid, continue_kind) == 0 { panic!(); }
-                break
-            }
+        // notify clients
+        clients.retain(|c| c.send(()).is_ok());
+
+        // wait for clients to respond
+        for _ in 0..clients.len() {
+            waiter.recv().ok();
+        }
+
+        if clients.is_empty() {
+            w!(ContinueDebugEvent(pid, tid, continue_kind));
+            break
         }
 
         // go past breakpointed instruction
@@ -178,7 +183,7 @@ async unsafe fn ppt_sync(barrier: &Barrier, notifier: &Notify) {
         }
     }
 
-    DebugActiveProcessStop(pid);
+    w!(DebugActiveProcessStop(pid));
 }
 
 unsafe fn breakpoint(
@@ -186,20 +191,16 @@ unsafe fn breakpoint(
 ) -> Option<()> {
     let mut original = 0u8;
     let mut rw = 0;
-    if ReadProcessMemory(
+    w!(ReadProcessMemory(
         process, address as *mut _, &mut original as *mut _ as *mut _, 1, &mut rw
-    ) == 0 {
-        panic!("read failed");
-    }
+    ))?;
 
-    if WriteProcessMemory(
+    w!(WriteProcessMemory(
         process, address as *mut _, &0xCC as *const _ as *const _, 1, &mut rw
-    ) == 0 {
-        panic!("write breakpoint failed");
-    }
+    ))?;
 
     loop {
-        if ContinueDebugEvent(pid, *tid, *continue_kind) == 0 { panic!(); }
+        w!(ContinueDebugEvent(pid, *tid, *continue_kind))?;
         let event = wait_for_event();
         *tid = event.dwThreadId;
         if event.dwDebugEventCode != EXCEPTION_DEBUG_EVENT {
@@ -220,24 +221,18 @@ unsafe fn breakpoint(
             continue;
         }
 
-        if WriteProcessMemory(
+        w!(WriteProcessMemory(
             process, address as *mut _, &original as *const _ as *const _, 1, &mut rw
-        ) == 0 {
-            panic!("writeback failed");
-        }
+        ))?;
 
         let thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, 0, *tid);
         let mut regs = CONTEXT::default();
         regs.ContextFlags = CONTEXT_ALL;
-        if GetThreadContext(thread, &mut regs) == 0 {
-            panic!("GetThreadContext failed: {}", GetLastError());
-        }
+        w!(GetThreadContext(thread, &mut regs))?;
         regs.Rip = address;
-        if SetThreadContext(thread, &regs) == 0 {
-            panic!("SetThreadContext failed: {}", GetLastError());
-        }
+        w!(SetThreadContext(thread, &regs))?;
         *continue_kind = DBG_CONTINUE;
-        CloseHandle(thread);
+        w!(CloseHandle(thread))?;
         return Some(());
     }
 }
@@ -246,17 +241,13 @@ unsafe fn step(pid: u32, tid: &mut u32, continue_kind: &mut u32) -> Option<()> {
     let thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, 0, *tid);
     let mut regs = CONTEXT::default();
     regs.ContextFlags = CONTEXT_ALL;
-    if GetThreadContext(thread, &mut regs) == 0 {
-        panic!("GetThreadContext failed: {}", GetLastError());
-    }
+    w!(GetThreadContext(thread, &mut regs))?;
     regs.EFlags |= 0x100;
-    if SetThreadContext(thread, &regs) == 0 {
-        panic!("SetThreadContext failed: {}", GetLastError());
-    }
+    w!(SetThreadContext(thread, &regs))?;
     CloseHandle(thread);
 
     loop {
-        if ContinueDebugEvent(pid, *tid, *continue_kind) == 0 { panic!(); }
+        w!(ContinueDebugEvent(pid, *tid, *continue_kind))?;
         let event = wait_for_event();
         *tid = event.dwThreadId;
         if event.dwDebugEventCode != EXCEPTION_DEBUG_EVENT {
