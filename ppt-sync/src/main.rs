@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 use std::sync::mpsc::{ Sender, Receiver, channel };
 use std::net::TcpListener;
 use std::io::prelude::*;
