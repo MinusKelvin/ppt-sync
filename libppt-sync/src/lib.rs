@@ -1,24 +1,23 @@
-use std::net::TcpStream;
 use std::process::{ Command, Stdio };
 use std::io::prelude::*;
+use named_pipe::PipeClient;
 
 pub struct PptSyncronizer {
-    connection: TcpStream,
+    connection: PipeClient,
     first_frame: bool
 }
 
 impl PptSyncronizer {
     pub fn new() -> std::io::Result<Self> {
-        let socket = TcpStream::connect("127.0.0.1:57236")
+        let connection = PipeClient::connect("\\\\.\\pipe\\ppt-sync")
             .or_else(|_| Command::new("ppt-sync")
                 .stdout(Stdio::piped())
                 .spawn()
                 .and_then(|child| child.stdout.unwrap().read_exact(&mut [0]))
-                .and_then(|_| TcpStream::connect("127.0.0.1:57236"))
+                .and_then(|_| PipeClient::connect("\\\\.\\pipe\\ppt-sync"))
             )?;
-        socket.set_nodelay(true)?;
         Ok(PptSyncronizer {
-            connection: socket,
+            connection,
             first_frame: true
         })
     }

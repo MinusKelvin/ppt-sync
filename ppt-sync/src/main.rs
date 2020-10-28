@@ -1,6 +1,6 @@
 #![windows_subsystem = "windows"]
 use std::sync::mpsc::{ Sender, Receiver, channel };
-use std::net::TcpListener;
+use named_pipe::{ PipeOptions };
 use std::io::prelude::*;
 use winapi::um::psapi::{ EnumProcesses, EnumProcessModules, GetModuleBaseNameW };
 use winapi::um::processthreadsapi::{ OpenProcess, OpenThread, GetThreadContext, SetThreadContext };
@@ -16,35 +16,32 @@ use std::os::windows::ffi::OsStringExt;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn main() -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:57236")?;
+    let mut listener = PipeOptions::new("\\\\.\\pipe\\ppt-sync").single()?;
     println!();
 
     let (done, waiter) = channel();
     let (notifs, conns) = channel();
 
-    std::thread::spawn(move || { let _: Result<_> = (|| {
-        for connection in listener.incoming() {
-            let mut connection = connection?;
-            let (notifier, wait) = channel();
-            notifs.send(notifier)?;
-            let done = done.clone();
-            connection.set_nodelay(true)?;
-            std::thread::spawn(move || { let _: Result<_> = (|| loop {
-                wait.recv()?;
-                let good = (|| {
-                    connection.write(&[0])?;
-                    connection.flush()?;
-                    connection.read_exact(&mut [0])
-                })().is_ok();
-                if !good {
-                    drop(wait);
-                    done.send(())?;
-                    return Ok(())
-                }
+    std::thread::spawn(move || { let _: Result<()> = (|| loop {
+        let mut connection = listener.wait()?;
+        listener = PipeOptions::new("\\\\.\\pipe\\ppt-sync").first(false).single()?;
+        let (notifier, wait) = channel();
+        notifs.send(notifier)?;
+        let done = done.clone();
+        std::thread::spawn(move || { let _: Result<_> = (|| loop {
+            wait.recv()?;
+            let good = (|| {
+                connection.write(&[0])?;
+                connection.flush()?;
+                connection.read_exact(&mut [0])
+            })().is_ok();
+            if !good {
+                drop(wait);
                 done.send(())?;
-            })();});
-        }
-        Ok(())
+                return Ok(())
+            }
+            done.send(())?;
+        })();});
     })();});
 
     unsafe {
