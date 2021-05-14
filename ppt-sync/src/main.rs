@@ -15,6 +15,11 @@ use std::os::windows::ffi::OsStringExt;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+// workaround for https://github.com/retep998/winapi-rs/issues/945
+#[derive(Default)]
+#[repr(align(16))]
+struct Context(CONTEXT);
+
 fn main() -> Result<()> {
     let mut listener = PipeOptions::new("\\\\.\\pipe\\ppt-sync").single()?;
     println!();
@@ -224,7 +229,7 @@ unsafe fn breakpoint(
         ))?;
 
         let thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, 0, *tid);
-        let mut regs = CONTEXT::default();
+        let mut regs = Context::default().0;
         regs.ContextFlags = CONTEXT_ALL;
         w!(GetThreadContext(thread, &mut regs))?;
         regs.Rip = address;
@@ -237,7 +242,7 @@ unsafe fn breakpoint(
 
 unsafe fn step(pid: u32, tid: &mut u32, continue_kind: &mut u32) -> Option<()> {
     let thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, 0, *tid);
-    let mut regs = CONTEXT::default();
+    let mut regs = Context::default().0;
     regs.ContextFlags = CONTEXT_ALL;
     w!(GetThreadContext(thread, &mut regs))?;
     regs.EFlags |= 0x100;
